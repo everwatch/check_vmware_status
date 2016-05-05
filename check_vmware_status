@@ -1,0 +1,131 @@
+#!/bin/sh
+
+hostname=""
+username="root"
+password=""
+port="22"
+doCmd="check"
+vmname=""
+reverse="0"
+
+print_help() {
+  cat <<__HELP_EOF__
+Author: Eric Loyd (eloyd@everwatch.global)
+Usage:  $0 -H <hostname> -n <VM name> [options]
+
+Required:
+        -H hostname     The hostname of the VMware server (no default)
+        -n vmname       The name of the VM guest machine (must match and be unique)
+
+Optional:
+        -c command      One of: check, poweron, poweroff (default is "check")
+        -u user         User to SSH as (default=root)
+        -p password     Password to use (only for testing, see below)
+        -P port         SSH port to use (default=22)
+
+This command will SSH to the VMware ESX server as USER and either check
+the power status of a virtual machine, or set the power state (and confirm
+that it ends up in the desired state).  Note that the ESX server will
+need its SSH server running and SSH firewall adjusted to allow access
+from the Nagios host.  Also, it is strongly recommended that you install
+an SSH key with no passphrase to /etc/ssh/key-<user>/authorized_keys
+to enable the nagios user on the Nagios host to SSH to the ESX server
+without needing a password or passphrase.  Otherwise, this plugin will
+fail and Nagios will timeout the service check with unknown results.
+
+Examples:
+
+  Return OK if the host windows.guest is powered on, or CRITICAL if it is powered off:
+        $0 -H vmserver.domain.com -n windows.guest
+
+  Return OK if the host linux.spare.guest is powered off, or CRITICAL if it is powered on:
+        $0 -H vmserver.domain.com -n linux.spare.guest -r
+
+  Turn off virtual machine broken.server:
+        $0 -H vmserver.domain.com -n broken.server -c poweroff
+
+  Turn on virtual machine fixed.server:
+        $0 -H vmserver.domain.com -n fixed.server -c poweron
+
+Note that poweroff and poweron will perform a power state check after
+changing the power state of the machine to verify that it matches the
+desired state.  If it does, the check will return OK.  If it does not,
+it will return CRITICAL.
+
+__HELP_EOF__
+}
+
+while [ -n "$1" ]; do
+  case "$1" in
+    -H) hostname="$2"; shift 2;;
+    -n) vmname="$2"; shift 2;;
+    -u) username="$2"; shift 2;;
+    -p) password="$2"; shift 2;;
+    -P) port="$2"; shift 2;;
+    -c) doCmd="$2"; shift 2;;
+    -r) reverse="1"; shift 1;;
+    -h) print_help; exit 2;;
+    *) shift 1;;
+  esac
+done
+
+[ -z "$hostname" ] && echo "No hostname specified (-H <hostname>)." && exit 3
+[ -z "$vmname" ] && echo "No VM name specified (-n <vmname>)." && exit 3
+[ -z "$username" ] && echo "No username specified (u <username>)." && exit 3
+[ -z "$port" ] && echo "No port specified (-P <port>)." && exit 3
+
+# $1 is host
+check_power_state() {
+  cmd="vim-cmd vmsvc/getallvms | egrep '^[0-9]+ +$1 +' | cut -d ' ' -f 1 | xargs vim-cmd vmsvc/power.getstate | tail -1"
+  output=`ssh -l $username -p $port $hostname "$cmd"`
+  [ "$output" = "Powered off" ] && return 0
+  [ "$output" = "Powered on" ] && return 1
+  return 2
+}
+
+# $1 is host
+# $2 is "on" or "off"
+change_power_state() {
+  cmd="vim-cmd vmsvc/getallvms | egrep '^[0-9]+ +$1 +1 | cut -d ' ' -f 1 | xargs vim-cmd vmsvc/power.$2"
+  ssh -l $username -p $port $hostname "$cmd" >/dev/null 2>&1
+  check_power_state "$1"
+  return "$?"
+}
+
+# Check the power state (on or off)
+if [ "$doCmd" = "check" ]; then
+  check_power_state "$vmname"
+  state="${reverse}${?}"
+  case "$state" in
+    00) echo "CRITICAL: $vmname is powered off." && exit 2;;
+    01) echo "OK: $vmname is powered on." && exit 0;;
+    10) echo "OK: $vmname is powered off." && exit 0;;
+    11) echo "CRITICAL: $vmname is powered on." && exit 2;;
+    *) echo "UNKNOWN: $vnname is in an unknown state."; exit 3;;
+  esac
+fi
+
+# What if we want to power it on?  Make sure it is on when we're done
+if [ "$doCmd" = "poweron" ]; then
+  change_power_state "$vmname" "on"
+  state="${?}"
+  case "$state" in
+    1) echo "OK: $vmname has been powered on"; exit 0;;
+    0) echo "WARNING: $vmname is still powered off."; exit 1;;
+    *) echo "CRITICAL: $vnmame is in an unknown state."; exit 2;;
+  esac
+fi
+
+# What if we want to power it off?  Make sure it is off when we're done
+if [ "$doCmd" = "poweroff" ]; then
+  change_power_state "$vmname" "off"
+  state="$?"
+  case "$state" in
+    0) echo "OK: $vmname has been powered off."; exit 0;;
+    1) echo "WARNING: $vmname is still powered on."; exit 1;;
+    *) echo "CRITICAL: $vnmame is in an unknown state."; exit 2;;
+  esac
+fi
+
+echo "UNKNOWN: You should not see this"
+exit 3
